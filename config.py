@@ -199,7 +199,15 @@ def _load_hermes_config_yaml() -> dict[str, Any]:
     return root
 
 
-_SUPPORTED_LCM_CONFIG_YAML_KEYS = {"context_threshold"}
+_SUPPORTED_LCM_CONFIG_YAML_KEYS = {
+    "context_threshold", "embeddings_enabled", "embedding_provider",
+    "embedding_model", "embedding_base_url", "embedding_api_key_env",
+    "embedding_query_prefix", "embedding_document_prefix",
+    "embedding_dimension", "embedding_max_batch_items",
+    "embedding_query_timeout_s", "recall_query_timeout_s",
+    "embedding_backfill_timeout_s", "embedding_storage_dtype",
+    "embedding_store_dim",
+}
 
 
 def _ignored_lcm_config_yaml_keys(cfg: dict[str, Any] | None = None) -> list[str]:
@@ -390,6 +398,11 @@ ENV_FIELD_SPECS: tuple[_EnvFieldSpec, ...] = (
     _EnvFieldSpec("knn_prescreen_multiplier", "LCM_KNN_PRESCREEN_MULTIPLIER", int),
     _EnvFieldSpec("embedding_provider", "LCM_EMBEDDING_PROVIDER", str),
     _EnvFieldSpec("embedding_model", "LCM_EMBEDDING_MODEL", str),
+    _EnvFieldSpec("embedding_base_url", "LCM_EMBEDDING_BASE_URL", str),
+    _EnvFieldSpec("embedding_api_key_env", "LCM_EMBEDDING_API_KEY_ENV", str),
+    _EnvFieldSpec("embedding_query_prefix", "LCM_EMBEDDING_QUERY_PREFIX", str),
+    _EnvFieldSpec("embedding_document_prefix", "LCM_EMBEDDING_DOCUMENT_PREFIX", str),
+    _EnvFieldSpec("embedding_dimension", "LCM_EMBEDDING_DIMENSION", int),
     _EnvFieldSpec("embedding_content_policy", "LCM_EMBED_CONTENT_POLICY", str),
     _EnvFieldSpec("ollama_base_url", "LCM_OLLAMA_BASE_URL", str),
     _EnvFieldSpec("embedding_query_timeout_s", "LCM_EMBEDDING_QUERY_TIMEOUT_S", float),
@@ -705,6 +718,13 @@ class LCMConfig:
     selective_compiler_model: str = ""
     embedding_provider: str = ""
     embedding_model: str = ""
+    # Local-only OpenAI-compatible Gemma endpoint. Provider prompt policy and
+    # pinned revision are encoded in the model identity so vector spaces cannot mix.
+    embedding_base_url: str = ""
+    embedding_api_key_env: str = ""
+    embedding_query_prefix: str = ""
+    embedding_document_prefix: str = ""
+    embedding_dimension: int = 0
     # Content-aware chunk policy for the raw-history chunk corpus:
     # conversational (default) | heads | full. Unknown values degrade to the
     # default in the chunker's normalize_content_policy.
@@ -847,6 +867,36 @@ class LCMConfig:
                 continue
             parser = _PARSER_BY_TYPE[spec.py_type]
             setattr(c, spec.name, parser(spec.env_key, getattr(c, spec.name)))
+
+        lcm_yaml = _load_hermes_config_yaml().get("lcm", {})
+        if isinstance(lcm_yaml, dict):
+            yaml_fields = {
+                "embeddings_enabled": ("LCM_EMBEDDINGS_ENABLED", bool),
+                "embedding_provider": ("LCM_EMBEDDING_PROVIDER", str),
+                "embedding_model": ("LCM_EMBEDDING_MODEL", str),
+                "embedding_base_url": ("LCM_EMBEDDING_BASE_URL", str),
+                "embedding_api_key_env": ("LCM_EMBEDDING_API_KEY_ENV", str),
+                "embedding_query_prefix": ("LCM_EMBEDDING_QUERY_PREFIX", str),
+                "embedding_document_prefix": ("LCM_EMBEDDING_DOCUMENT_PREFIX", str),
+                "embedding_dimension": ("LCM_EMBEDDING_DIMENSION", int),
+                "embedding_max_batch_items": ("LCM_EMBEDDING_MAX_BATCH_ITEMS", int),
+                "embedding_query_timeout_s": ("LCM_EMBEDDING_QUERY_TIMEOUT_S", float),
+                "recall_query_timeout_s": ("LCM_RECALL_QUERY_TIMEOUT_S", float),
+                "embedding_backfill_timeout_s": ("LCM_EMBEDDING_BACKFILL_TIMEOUT_S", float),
+                "embedding_storage_dtype": ("LCM_EMBEDDING_STORAGE_DTYPE", str),
+                "embedding_store_dim": ("LCM_EMBEDDING_STORE_DIM", int),
+            }
+            for field_name, (env_name, value_type) in yaml_fields.items():
+                if field_name in lcm_yaml and env_name not in os.environ:
+                    try:
+                        value = lcm_yaml[field_name]
+                        if value_type is bool:
+                            value = not _config_bool_disabled(value)
+                        else:
+                            value = value_type(value)
+                        setattr(c, field_name, value)
+                    except (TypeError, ValueError):
+                        pass
 
         # Pattern-list overrides carry a source sidecar and stay explicit.
         raw_sensitive_patterns = os.environ.get("LCM_SENSITIVE_PATTERNS")

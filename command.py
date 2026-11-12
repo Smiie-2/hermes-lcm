@@ -2725,7 +2725,11 @@ def _embedding_warmup_text(engine) -> str:
             cost_note = (
                 "API usage may incur provider charges"
                 if provider.provider_id == "voyage"
-                else "local Ollama model; no per-call API charge"
+                else (
+                    "local EmbeddingGemma model; no per-call API charge"
+                    if provider.provider_id == "gemma"
+                    else "local Ollama model; no per-call API charge"
+                )
             )
 
         dim = len(vector)

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import queue
 import threading
@@ -1676,6 +1677,114 @@ class FastembedProvider(_ResilientProvider):
         return self._embed((str(text),), query=True)[0]
 
 
+class GemmaProvider(_ResilientProvider):
+    """Pinned local EmbeddingGemma OpenAI-compatible service."""
+
+    provider_id = "gemma"
+
+    def __init__(self, model: str, *, base_url: str, query_prefix: str,
+                 document_prefix: str, expected_dim: int = 768,
+                 max_batch_items: int = 8, transport: HttpTransport | None = None,
+                 timeout: float = 120.0,
+                 spend_guard: EmbeddingSpendGuard | None = None) -> None:
+        super().__init__(spend_guard=spend_guard)
+        self._model_id = str(model).strip()
+        self.base_url = str(base_url).strip().rstrip("/")
+        if not self._model_id or not self.base_url:
+            raise ValueError("Gemma model and local embedding base URL are required")
+        from urllib.parse import urlsplit
+        host = (urlsplit(self.base_url).hostname or "").lower()
+        if host not in {"127.0.0.1", "localhost", "::1"}:
+            raise ValueError("Gemma embeddings must use a loopback-only endpoint")
+        self.query_prefix = str(query_prefix)
+        self.document_prefix = str(document_prefix)
+        self.expected_dim = int(expected_dim)
+        if self.expected_dim != 768:
+            raise ValueError("EmbeddingGemma 2 profile dimension must be 768")
+        self.max_batch_items = max(1, int(max_batch_items))
+        self._transport = transport or _default_http_transport
+        self.timeout = float(timeout)
+        self._dim = 0
+
+    @property
+    def model_id(self) -> str:
+        return self._model_id
+
+    @property
+    def dim(self) -> int:
+        return self._dim
+
+    @staticmethod
+    def _role_text(text: str, prefix: str) -> str:
+        value = str(text)
+        return value if not prefix or value.startswith(prefix) else prefix + value
+
+    def _embed(self, texts: Sequence[str], *, deadline: float,
+               before_transport: Callable[[], None] | None = None) -> list[list[float]]:
+        if time.monotonic() >= deadline:
+            raise EmbeddingProviderError("Gemma embedding deadline exceeded")
+        if before_transport is not None:
+            before_transport()
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise ProviderPreDispatchError("Gemma deadline exceeded before transport")
+        response = self._transport(
+            url=f"{self.base_url}/embeddings",
+            payload={"model": self.model_id, "input": list(texts)},
+            headers={"Content-Type": "application/json"},
+            timeout=remaining,
+        )
+        if not 200 <= response.status < 300:
+            raise EmbeddingProviderError(f"Gemma embedding request failed ({response.status})")
+        data = _response_json(response, provider="Gemma")
+        rows = data.get("data")
+        if not isinstance(rows, list):
+            raise EmbeddingProviderError("Gemma response did not contain embedding data")
+        rows = sorted(rows, key=lambda row: int(row.get("index", 0))
+                      if isinstance(row, dict) else 0)
+        vectors = _coerce_vectors(
+            [row.get("embedding") for row in rows if isinstance(row, dict)], provider="Gemma"
+        )
+        if len(vectors) != len(texts):
+            raise EmbeddingProviderError("Gemma returned a different number of vectors than requested")
+        normalized = []
+        for vector in vectors:
+            if len(vector) != self.expected_dim or not all(math.isfinite(x) for x in vector):
+                raise EmbeddingProviderError("Gemma vector has invalid dimension or values")
+            norm = math.sqrt(sum(x * x for x in vector))
+            if norm <= 1e-12:
+                raise EmbeddingProviderError("Gemma returned a zero-norm vector")
+            normalized.append([x / norm for x in vector])
+        if time.monotonic() >= deadline:
+            raise EmbeddingProviderError("Gemma embedding deadline exceeded during response processing")
+        self._dim = self.expected_dim
+        return normalized
+
+    def embed_query(self, text: str) -> list[float]:
+        prompt = self._role_text(text, self.query_prefix)
+        return self._guarded(lambda: self._embed((prompt,), deadline=time.monotonic() + self.timeout))[0]
+
+    def embed_query_interactive(self, text: str, *, timeout: float) -> list[float]:
+        prompt = self._role_text(text, self.query_prefix)
+        return self._guarded(lambda: self._embed((prompt,), deadline=time.monotonic() + timeout))[0]
+
+    def embed_documents(self, texts: Sequence[str]) -> list[list[float]]:
+        return [list(vector) for batch in self.embed_document_batches(texts) for vector in batch.vectors]
+
+    def embed_document_batches(self, texts: Sequence[str], *,
+                               before_dispatch: BeforeDispatch | None = None
+                               ) -> Iterator[EmbeddedDocumentBatch]:
+        prepared = tuple(self._role_text(text, self.document_prefix) for text in texts)
+        deadline = time.monotonic() + self.timeout
+        for start in range(0, len(prepared), self.max_batch_items):
+            end = min(start + self.max_batch_items, len(prepared))
+            indexes = tuple(range(start, end))
+            dispatch = (lambda indexes=indexes: before_dispatch(indexes)) if before_dispatch else None
+            vectors = self._guarded(lambda start=start, end=end, dispatch=dispatch: self._embed(
+                prepared[start:end], deadline=deadline, before_transport=dispatch))
+            yield EmbeddedDocumentBatch(indexes, tuple(tuple(v) for v in vectors))
+
+
 def resolve_provider(
     config: LCMConfig, *, for_backfill: bool = False
 ) -> EmbeddingProvider | None:
@@ -1744,12 +1853,24 @@ def resolve_provider(
             timeout=timeout,
             spend_guard=spend_guard,
         )
+    if provider == "gemma":
+        return GemmaProvider(
+            model,
+            base_url=getattr(config, "embedding_base_url", ""),
+            query_prefix=getattr(config, "embedding_query_prefix", ""),
+            document_prefix=getattr(config, "embedding_document_prefix", ""),
+            expected_dim=int(getattr(config, "embedding_dimension", 768) or 768),
+            max_batch_items=int(getattr(config, "embedding_max_batch_items", 8)),
+            timeout=timeout,
+            spend_guard=spend_guard,
+        )
     if provider in {"fastembed", "fast-embed"}:
         return FastembedProvider(
             model, timeout=timeout, spend_guard=spend_guard
         )
     raise ProviderUnavailable(
-        f"Unsupported embedding provider {provider!r}; use voyage, ollama, or fastembed"
+        f"Unsupported embedding provider {provider!r}; use voyage, ollama, "
+        "gemma (local EmbeddingGemma), or fastembed"
     )
 
 

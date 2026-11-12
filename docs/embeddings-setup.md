@@ -1,7 +1,7 @@
 # Embeddings setup — free and local options
 
-Semantic and hybrid retrieval are **opt-in** and need an embedding provider. You have three good
-options, two of which cost nothing. If you configure nothing, nothing changes — retrieval stays
+Semantic and hybrid retrieval are **opt-in** and need an embedding provider. You have four good
+options, three of which have no per-request cost. If you configure nothing, nothing changes — retrieval stays
 FTS-only exactly as before.
 
 ## TL;DR
@@ -11,6 +11,7 @@ FTS-only exactly as before.
 | Voyage AI | free tier (200M tokens for the voyage-4 group), then ~$0.02–0.12 per million tokens | yes (no credit card) | none | best quality, zero local footprint |
 | fastembed | $0 | no | `pip install fastembed` (ONNX, no torch) | local default — no accounts, no daemon |
 | Ollama | $0 | no | Ollama app/daemon | you already run Ollama |
+| EmbeddingGemma 2 | $0 | no | local pinned CUDA service | an existing local Gemma cache and CUDA GPU |
 
 All providers feed the same store. Switching provider/model is one config change plus a backfill;
 each full identity keeps its own vectors, so switching **back** to a
@@ -92,12 +93,38 @@ resent.
 
 Bulk document embedding uses `LCM_EMBEDDING_BACKFILL_TIMEOUT_S` as its
 per-provider-operation deadline (120 seconds by default) for Voyage, Ollama,
-and fastembed. This is intentionally separate from the latency-sensitive
+Gemma, and fastembed. This is intentionally separate from the latency-sensitive
 `LCM_EMBEDDING_QUERY_TIMEOUT_S` (3 seconds by default), so a normal document
 batch or local model load is not aborted by the interactive query policy. The
 optional `LCM_EMBEDDING_BACKFILL_BUDGET_S` still caps the whole apply run
 between batches (`0`, the default, means no whole-run cap); the lease and
 post-call ownership CAS remain authoritative independently of both timeouts.
+
+## Option 4 — EmbeddingGemma 2 (local pinned endpoint)
+
+The `gemma` provider accepts only a loopback OpenAI-compatible embeddings endpoint. Configure
+the `lcm` keys with `hermes config set`; the installed LCM plugin reads these values during engine
+initialization. `embedding_model` must include the immutable model revision and a prompt-policy
+suffix so a changed model or role prompt registers a separate vector identity. The current profile
+uses 768-D float32 vectors, query prompt `task: search result | query: `, and untitled-document
+prompt `title: none | text: `. The provider applies each prefix once; the service does not prepend
+another prefix to already role-marked input. Non-loopback URLs and non-768 dimensions are rejected.
+
+```bash
+hermes config set lcm.embeddings_enabled true
+hermes config set lcm.embedding_provider gemma
+hermes config set lcm.embedding_model 'google/embeddinggemma-2@<revision>+<role-prompt-policy>'
+hermes config set lcm.embedding_base_url http://127.0.0.1:<port>/v1
+hermes config set lcm.embedding_dimension 768
+hermes config set lcm.embedding_query_prefix 'task: search result | query: '
+hermes config set lcm.embedding_document_prefix 'title: none | text: '
+hermes config set lcm.embedding_storage_dtype float32
+hermes config set lcm.embedding_store_dim 768
+```
+
+Run warmup and summary backfill after activating the configuration in a fresh LCM engine. Keep the
+endpoint on a dedicated port; do not reuse or reconfigure another embedding/Hindsight service.
+Chunk/raw-message indexing is separate and remains off unless explicitly requested.
 
 ## What you get
 
@@ -190,7 +217,7 @@ unless you pass an explicit acknowledgment:
 /lcm embed backfill --corpus chunks --apply --confirm-raw-text
 ```
 
-Local providers (**fastembed**, **ollama**) never transmit text off the machine, so the gate is
+Local providers (**fastembed**, **ollama**, **Gemma**) never transmit text off the machine, so the gate is
 waived for them. Dry runs (no `--apply`) never send anything and never require the flag.
 
 > **Redaction caveat.** `LCM_SENSITIVE_PATTERNS_ENABLED` redaction runs at **ingest** time, so it
